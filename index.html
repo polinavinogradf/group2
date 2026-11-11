@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Посещаемость группы</title>
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<style>
+  :root { --bg:#f7f8fa; --card:#fff; --ink:#1f2937; --muted:#6b7280; --accent:#2563eb; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+         background:var(--bg); color:var(--ink); padding:16px; }
+  h1 { font-size:1.4rem; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:.9rem; margin-bottom:16px; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin-bottom:16px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; box-shadow:0 1px 3px rgba(0,0,0,.06); }
+  .card .num { font-size:1.8rem; font-weight:700; color:var(--accent); }
+  .card .lbl { font-size:.8rem; color:var(--muted); margin-top:2px; }
+  .chart { background:var(--card); border-radius:12px; padding:8px; margin-bottom:16px;
+           box-shadow:0 1px 3px rgba(0,0,0,.06); }
+  .chart .h { font-size:1rem; font-weight:600; padding:8px 12px 0; }
+  .box { width:100%; height:340px; }
+  footer { color:var(--muted); font-size:.8rem; line-height:1.4; padding:8px 4px 24px; }
+  #err { display:none; background:#fef2f2; color:#991b1b; border:1px solid #fecaca;
+         border-radius:12px; padding:16px; margin-bottom:16px; }
+</style>
+</head>
+<body>
+  <h1>Посещаемость группы</h1>
+  <div class="sub">Данные обезличены: студенты обозначены кодами S01, S02…</div>
+
+  <div id="err"></div>
+
+  <div class="cards">
+    <div class="card"><div class="num" id="kAvg">—</div><div class="lbl">средняя посещаемость, %</div></div>
+    <div class="card"><div class="num" id="kStudents">—</div><div class="lbl">студентов</div></div>
+    <div class="card"><div class="num" id="kLessons">—</div><div class="lbl">занятий</div></div>
+  </div>
+
+  <div class="chart"><div class="h">Явка по занятиям, % (пунктир — среднее)</div><div id="line" class="box"></div></div>
+  <div class="chart"><div class="h">Распределение студентов по доле посещений</div><div id="bar" class="box"></div></div>
+
+  <footer>
+    Источник: обезличенный файл <b>attendance.csv</b> (коды вместо фамилий, строки перемешаны до присвоения кодов).
+    Персональные данные не публикуются.
+  </footer>
+
+<script>
+// ---------- Парсер CSV: кавычки, запятая и точка с запятой ----------
+function detectDelimiter(text) {
+  const firstLine = text.split(/\r?\n/).find(l => l.trim() !== '') || '';
+  const semi = (firstLine.match(/;/g) || []).length;
+  const comma = (firstLine.match(/,/g) || []).length;
+  return semi > comma ? ';' : ',';
+}
+
+function parseCSV(text) {
+  const delim = detectDelimiter(text);
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i+1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else {
+      if (c === '"') inQuotes = true;
+      else if (c === delim) { row.push(field); field = ''; }
+      else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+      else if (c === '\r') { /* skip */ }
+      else field += c;
+    }
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(v => v.trim() !== ''));
+}
+
+// ---------- Загрузка с fallback на windows-1251 ----------
+async function loadCSV(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const buf = await res.arrayBuffer();
+  let text = new TextDecoder('utf-8', { fatal: false }).decode(buf);
+  const bad = (text.match(/\uFFFD/g) || []).length;
+  if (bad > 3) {
+    try { text = new TextDecoder('windows-1251').decode(buf); } catch (e) {}
+  }
+  return text;
+}
+
+// ---------- Построение ----------
+function build(rows) {
+  const header = rows[0].map(h => h.trim());
+  const codeIdx = header.findIndex(h => h.toLowerCase() === 'code');
+  if (codeIdx === -1) throw new Error('В CSV нет колонки code');
+
+  const lessonCols = header.map((h, i) => ({ h, i }))
+    .filter(o => o.i !== codeIdx && /^\d{4}-\d{2}-\d{2}$/.test(o.h));
+
+  if (lessonCols.length === 0) throw new Error('В CSV нет колонок-дат вида ГГГГ-ММ-ДД');
+
+  const students = [];
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    if (!row[codeIdx] || !row[codeIdx].trim()) continue;
+    const vals = lessonCols.map(o => {
+      const v = (row[o.i] ?? '').trim();
+      if (v === '1') return 1;
+      if (v === '0') return 0;
+      return null;
+    });
+    students.push({ code: row[codeIdx].trim(), vals });
+  }
+
+  const perLesson = lessonCols.map((o, j) => {
+    let present = 0, total = 0;
+    students.forEach(s => { if (s.vals[j] !== null) { total++; if (s.vals[j] === 1) present++; } });
+    return { date: o.h, pct: total ? +(100 * present / total).toFixed(1) : 0, present, total };
+  });
+
+  const totalCells = perLesson.reduce((a, x) => a + x.total, 0);
+  const totalPresent = perLesson.reduce((a, x) => a + x.present, 0);
+  const avg = totalCells ? +(100 * totalPresent / totalCells).toFixed(1) : 0;
+
+  const buckets = [0, 0, 0, 0];
+  students.forEach(s => {
+    const known = s.vals.filter(v => v !== null);
+    const present = known.filter(v => v === 1).length;
+    const pct = known.length ? 100 * present / known.length : 0;
+    if (pct < 25) buckets[0]++;
+    else if (pct < 50) buckets[1]++;
+    else if (pct < 75) buckets[2]++;
+    else buckets[3]++;
+  });
+
+  return { students, lessonCols, perLesson, avg, buckets };
+}
+
+function render(d) {
+  document.getElementById('kAvg').textContent = d.avg + '%';
+  document.getElementById('kStudents').textContent = d.students.length;
+  document.getElementById('kLessons').textContent = d.lessonCols.length;
+
+  const line = echarts.init(document.getElementById('line'));
+  const dates = d.perLesson.map(x => x.date);
+  line.setOption({
+    tooltip: { trigger: 'axis', valueFormatter: v => v + '%' },
+    grid: { left: 40, right: 20, top: 30, bottom: 40 },
+    xAxis: { type: 'category', data: dates, axisLabel: { rotate: 45, fontSize: 10 } },
+    yAxis: { type: 'value', min: 0, max: 100, axisLabel: { formatter: '{value}%' } },
+    series: [
+      { name: 'Явка', type: 'line', smooth: true, data: d.perLesson.map(x => x.pct),
+        symbolSize: 6, lineStyle: { width: 2, color: '#2563eb' }, itemStyle: { color: '#2563eb' } },
+      { name: 'Среднее', type: 'line', data: dates.map(() => d.avg),
+        lineStyle: { type: 'dashed', color: '#9ca3af', width: 1 }, symbol: 'none' }
+    ],
+    legend: { top: 0 }
+  });
+
+  const bar = echarts.init(document.getElementById('bar'));
+  bar.setOption({
+    tooltip: { trigger: 'axis' },
+    grid: { left: 40, right: 20, top: 30, bottom: 40 },
+    xAxis: { type: 'category', data: ['<25%', '25–50%', '50–75%', '≥75%'],
+             axisLabel: { fontSize: 11 } },
+    yAxis: { type: 'value', name: 'студентов', minInterval: 1 },
+    series: [{ type: 'bar', data: d.buckets, itemStyle: { color: '#2563eb' },
+               label: { show: true, position: 'top' } }]
+  });
+
+  const ro = () => { line.resize(); bar.resize(); };
+  window.addEventListener('resize', ro);
+  window.addEventListener('orientationchange', ro);
+}
+
+(async () => {
+  const errBox = document.getElementById('err');
+  try {
+    const text = await loadCSV('attendance.csv');
+    const rows = parseCSV(text);
+    if (rows.length < 2) throw new Error('CSV пустой или без данных');
+    render(build(rows));
+  } catch (e) {
+    errBox.style.display = 'block';
+    errBox.innerHTML = '<b>Не удалось загрузить данные.</b><br>' +
+      'Файл <code>attendance.csv</code> должен лежать рядом с этой страницей в репозитории. ' +
+      'Техническая причина: ' + e.message +
+      '<br>Если вы открыли файл двойным щелчком с диска — браузер запрещает чтение CSV. ' +
+      'Смотрите страницу после публикации через GitHub Pages.';
+  }
+})();
+</script>
+</body>
+</html>
